@@ -105,6 +105,7 @@ FSG_MODULE_PARAMETERS(/* no prefix */, mod_data);
 
 static int msg_do_config(struct usb_configuration *c)
 {
+	pr_err("msg_do_config\n");
 	int ret;
 
 	if (gadget_is_otg(c->cdev->gadget)) {
@@ -138,6 +139,7 @@ static struct usb_configuration msg_config_driver = {
 
 static int msg_bind(struct usb_composite_dev *cdev)
 {
+	pr_err("msg_bind\n");
 	struct fsg_opts *opts;
 	struct fsg_config config;
 	int status;
@@ -175,10 +177,8 @@ static int msg_bind(struct usb_composite_dev *cdev)
 		struct usb_descriptor_header *usb_desc;
 
 		usb_desc = usb_otg_descriptor_alloc(cdev->gadget);
-		if (!usb_desc) {
-			status = -ENOMEM;
+		if (!usb_desc)
 			goto fail_string_ids;
-		}
 		usb_otg_descriptor_init(cdev->gadget, usb_desc);
 		otg_desc[0] = usb_desc;
 		otg_desc[1] = NULL;
@@ -207,6 +207,7 @@ fail:
 
 static int msg_unbind(struct usb_composite_dev *cdev)
 {
+	pr_err("msg_unbind\n");
 	if (!IS_ERR(f_msg))
 		usb_put_function(f_msg);
 
