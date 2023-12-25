@@ -57,13 +57,70 @@ static int of_get_mac_addr(struct device_node *np, const char *name, u8 *addr)
 	return -ENODEV;
 }
 
+static void *nvmem_cell_get_mac_address(struct nvmem_cell *cell)
+{
+	size_t len;
+	void *mac;
+
+	mac = nvmem_cell_read(cell, &len);
+	if (IS_ERR(mac))
+		return mac;
+	if (len != ETH_ALEN) {
+		kfree(mac);
+		return ERR_PTR(-EINVAL);
+	}
+	return mac;
+}
+
+static void *nvmem_cell_get_mac_address_ascii(struct nvmem_cell *cell)
+{
+	size_t len;
+	int ret;
+	void *mac_ascii;
+	u8 *mac;
+
+	mac_ascii = nvmem_cell_read(cell, &len);
+	if (IS_ERR(mac_ascii))
+		return mac_ascii;
+	if (len != ETH_ALEN*2+5) {
+		kfree(mac_ascii);
+		return ERR_PTR(-EINVAL);
+	}
+	mac = kmalloc(ETH_ALEN, GFP_KERNEL);
+	if (!mac) {
+		kfree(mac_ascii);
+		return ERR_PTR(-ENOMEM);
+	}
+	ret = sscanf(mac_ascii, "%2hhx:%2hhx:%2hhx:%2hhx:%2hhx:%2hhx",
+				&mac[0], &mac[1], &mac[2],
+				&mac[3], &mac[4], &mac[5]);
+	kfree(mac_ascii);
+	if (ret == ETH_ALEN)
+		return mac;
+	kfree(mac);
+	return ERR_PTR(-EINVAL);
+}
+
+static struct nvmem_cell_mac_address_property {
+	char *name;
+	void *(*read)(struct nvmem_cell *);
+} nvmem_cell_mac_address_properties[] = {
+	{
+		.name = "mac-address",
+		.read = nvmem_cell_get_mac_address,
+	}, {
+		.name = "mac-address-ascii",
+		.read = nvmem_cell_get_mac_address_ascii,
+	},
+};
+
 static int of_get_mac_addr_nvmem(struct device_node *np, u8 *addr)
 {
 	struct platform_device *pdev = of_find_device_by_node(np);
+	struct nvmem_cell_mac_address_property *property;
 	struct nvmem_cell *cell;
 	const void *mac;
-	size_t len;
-	int ret;
+	int ret, i;
 
 	/* Try lookup by device first, there might be a nvmem_cell_lookup
 	 * associated with a given device.
@@ -74,17 +131,26 @@ static int of_get_mac_addr_nvmem(struct device_node *np, u8 *addr)
 		return ret;
 	}
 
-	cell = of_nvmem_cell_get(np, "mac-address");
+	for (i = 0; i < ARRAY_SIZE(nvmem_cell_mac_address_properties); i++) {
+		property = &nvmem_cell_mac_address_properties[i];
+		cell = of_nvmem_cell_get(np, property->name);
+		/* For -EPROBE_DEFER don't try other properties.
+		 * We'll get back to this one.
+		 */
+		if (!IS_ERR(cell) || PTR_ERR(cell) == -EPROBE_DEFER)
+			break;
+	}
+
 	if (IS_ERR(cell))
 		return PTR_ERR(cell);
 
-	mac = nvmem_cell_read(cell, &len);
+	mac = property->read(cell);
 	nvmem_cell_put(cell);
 
 	if (IS_ERR(mac))
 		return PTR_ERR(mac);
 
-	if (len != ETH_ALEN || !is_valid_ether_addr(mac)) {
+	if (!is_valid_ether_addr(mac)) {
 		kfree(mac);
 		return -EINVAL;
 	}
@@ -194,9 +260,40 @@ found:
 		addr[3] = (mac_val >> 16) & 0xff;
 		addr[4] = (mac_val >> 8) & 0xff;
 		addr[5] = (mac_val >> 0) & 0xff;
+
+		/* Remove mac-address-increment and mac-address-increment-byte
+		 * DT property to make sure MAC address would not get incremented
+		 * more if this function is stared again. */
+		of_remove_property(np, of_find_property(np, "mac-address-increment", NULL));
+		of_remove_property(np, of_find_property(np, "mac-address-increment-byte", NULL));
 	}
 
 	of_add_mac_address(np, addr);
 	return ret;
 }
 EXPORT_SYMBOL(of_get_mac_address);
+
+/**
+ * of_get_ethdev_address()
+ * @np:		Caller's Device Node
+ * @dev:	Pointer to netdevice which address will be updated
+ *
+ * Search the device tree for the best MAC address to use.
+ * If found set @dev->dev_addr to that address.
+ *
+ * See documentation of of_get_mac_address() for more information on how
+ * the best address is determined.
+ *
+ * Return: 0 on success and errno in case of error.
+ */
+int of_get_ethdev_address(struct device_node *np, struct net_device *dev)
+{
+	u8 addr[ETH_ALEN];
+	int ret;
+
+	ret = of_get_mac_address(np, addr);
+	if (!ret)
+		eth_hw_addr_set(dev, addr);
+	return ret;
+}
+EXPORT_SYMBOL(of_get_ethdev_address);
