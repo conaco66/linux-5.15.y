@@ -703,6 +703,69 @@ static int dwc3_meson_gxl_usb_post_init(struct dwc3_meson_g12a *priv)
 	return 0;
 }
 
+/*
+ * NaoYun: per-port USB2 PHY reset + full re-initialization.
+ *
+ * Write a port index to /sys/devices/platform/soc/<glue>/u2p_reset:
+ *   echo 0 > u2p_reset   -> the host socket on usb2-phy0  (the mouse port)
+ *   echo 1 > u2p_reset   -> the OTG socket on usb2-phy1   (the PC port)
+ *
+ * Why: the mouse port can fall into a state where every enumeration of a
+ * newly connected low-speed device returns corrupted descriptors
+ * (error -71, "unable to enumerate USB device") and stays there until the
+ * PHY is reset. Measured on S905L3A/M401A with 5.15.145-conaco66: rebinding
+ * xHCI alone does not clear it, and poking the glue's per-port
+ * U2P_R0_POWER_ON_RESET bit alone does not either (the write was verified,
+ * the port then completed a reset and still failed to enumerate). Only a
+ * glue rebind recovers it - and the unique ingredient there is each PHY's
+ * .exit doing reset_control_reset() plus .init re-running the analog
+ * front-end tuning. A glue rebind also tears down the dwc3/dwc2 children
+ * and the role switch, which is unacceptable while the other socket carries
+ * a live session. This attribute applies the same sequence to exactly one
+ * port.
+ *
+ * Semantics: the PHY is reset and re-initialized; the port then enumerates
+ * normally on the next connection event (it does not re-try by itself).
+ * The OTG port keeps its current role - it is never forced to host here.
+ */
+static ssize_t u2p_reset_store(struct device *dev,
+			       struct device_attribute *attr,
+			       const char *buf, size_t len)
+{
+	struct dwc3_meson_g12a	*priv = dev_get_drvdata(dev);
+	enum phy_mode		mode;
+	unsigned int		i;
+	int			ret;
+
+	if (kstrtouint(buf, 10, &i) || i >= PHY_COUNT || !priv->phys[i] ||
+	    !priv->u2p_regmap[i])
+		return -EINVAL;
+
+	ret = pm_runtime_get_sync(dev);
+	if (ret < 0) {
+		pm_runtime_put_noidle(dev);
+		return ret;
+	}
+
+	mode = (i == USB2_OTG_PHY) ? priv->otg_phy_mode : PHY_MODE_USB_HOST;
+
+	phy_power_off(priv->phys[i]);
+	phy_exit(priv->phys[i]);
+	ret = phy_init(priv->phys[i]);
+	if (!ret)
+		ret = phy_power_on(priv->phys[i]);
+	if (!ret)
+		ret = priv->drvdata->usb2_init_phy(priv, i, mode);
+
+	pm_runtime_put(dev);
+
+	if (ret)
+		return ret;
+
+	return len;
+}
+static DEVICE_ATTR_WO(u2p_reset);
+
 static int dwc3_meson_g12a_probe(struct platform_device *pdev)
 {
 	struct dwc3_meson_g12a	*priv;
@@ -811,6 +874,9 @@ static int dwc3_meson_g12a_probe(struct platform_device *pdev)
 	pm_runtime_enable(dev);
 	pm_runtime_get_sync(dev);
 
+	if (device_create_file(dev, &dev_attr_u2p_reset.attr))
+		dev_warn(dev, "Failed to create u2p_reset attribute (USB remains functional)\n");
+
 	return 0;
 
 err_plat_depopulate:
@@ -843,6 +909,8 @@ static int dwc3_meson_g12a_remove(struct platform_device *pdev)
 	struct dwc3_meson_g12a *priv = platform_get_drvdata(pdev);
 	struct device *dev = &pdev->dev;
 	int i;
+
+	device_remove_file(dev, &dev_attr_u2p_reset.attr);
 
 	if (priv->drvdata->otg_switch_supported)
 		usb_role_switch_unregister(priv->role_switch);
