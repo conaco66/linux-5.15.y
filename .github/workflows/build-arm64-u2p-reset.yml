@@ -67,6 +67,9 @@ jobs:
             git apply -v -p1 naoyun-u2p-reset.patch
           fi
           grep -n "DEVICE_ATTR_WO(u2p_reset)" drivers/usb/dwc3/dwc3-meson-g12a.c
+          # f_hid v4 是整文件替换版，已在树里；不在就终止，禁止静默出 stock 版
+          grep -n 'MODULE_VERSION("naoyun-auth-v' drivers/usb/gadget/function/f_hid.c
+          ls -l naoyun-build/motion/naoyun_motion.c naoyun-build/motion/Makefile
 
       - name: 编译 Image + modules + dtbs
         run: |
@@ -74,11 +77,35 @@ jobs:
                LOCALVERSION="$KERNEL_LOCALVERSION" -j"$(nproc)" \
                Image modules dtbs
 
+      - name: 编译 naoyun_motion（外部模块，借同一棵已备好的树）
+        run: |
+          # 整树这时已有 scripts/ 与 Module.symvers，M= 方式编译外部模块只需这两样。
+          # 同树同 clang 同 config ⇒ vermagic 天然与这颗内核一致，盒上不再需要凑 headers。
+          make ARCH=arm64 CC=clang LD=ld.lld LLVM=1 LLVM_IAS=1 \
+               LOCALVERSION="$KERNEL_LOCALVERSION" \
+               M="$PWD/naoyun-build/motion" modules
+          ls -l naoyun-build/motion/naoyun_motion.ko
+
       - name: 装模块树
         run: |
           make ARCH=arm64 CC=clang LD=ld.lld LLVM=1 LLVM_IAS=1 \
                LOCALVERSION="$KERNEL_LOCALVERSION" \
                INSTALL_MOD_PATH="$PWD/stage/modules-root" modules_install
+          V=$(cat include/config/kernel.release)
+          mkdir -p "stage/modules-root/lib/modules/$V/extra"
+          cp naoyun-build/motion/naoyun_motion.ko "stage/modules-root/lib/modules/$V/extra/"
+
+      - name: 记录两个 naoyun 模块的指纹（防漂移，对照仓库里钉的 srcversion）
+        run: |
+          V=$(cat include/config/kernel.release)
+          {
+            echo "== usb_f_hid（树内 v4）=="
+            modinfo "stage/modules-root/lib/modules/$V/kernel/drivers/usb/gadget/function/usb_f_hid.ko" 2>/dev/null |
+              grep -E '^(filename|version|srcversion|vermagic)'
+            echo "== naoyun_motion（extra）=="
+            modinfo "stage/modules-root/lib/modules/$V/extra/naoyun_motion.ko" |
+              grep -E '^(filename|srcversion|vermagic)'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: 打包产物并算校验和
         run: |
