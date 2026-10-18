@@ -69,6 +69,9 @@ jobs:
           grep -n "DEVICE_ATTR_WO(u2p_reset)" drivers/usb/dwc3/dwc3-meson-g12a.c
           # f_hid v4 是整文件替换版，已在树里；不在就终止，禁止静默出 stock 版
           grep -n 'MODULE_VERSION("naoyun-auth-v' drivers/usb/gadget/function/f_hid.c
+          # v4 的配套头也必须在：struct f_hid_feat_store 只在补丁版 u_hid.h 里定义，
+          # 少了它整树编译会死在 "incomplete definition of type"（run#4 的真实死因）
+          grep -n "struct f_hid_feat_store" drivers/usb/gadget/function/u_hid.h
           ls -l naoyun-build/motion/naoyun_motion.c naoyun-build/motion/Makefile
 
       - name: 编译 Image + modules + dtbs
