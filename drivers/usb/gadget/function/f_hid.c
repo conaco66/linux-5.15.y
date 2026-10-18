@@ -13,6 +13,7 @@
 #include <linux/mutex.h>
 #include <linux/poll.h>
 #include <linux/uaccess.h>
+#include <linux/uio.h>		/* NaoYun Auth patch v4: copy_from_iter / iov_iter_count */
 #include <linux/wait.h>
 #include <linux/sched.h>
 #include <linux/usb/g_hid.h>
@@ -34,6 +35,18 @@ struct f_hidg_req_list {
 	struct usb_request	*req;
 	unsigned int		pos;
 	struct list_head 	list;
+};
+
+/* NaoYun Auth patch: PS5 DualSense Feature Report 用户态中继通道
+ * 质询(0x80/0xF0)经 SET_REPORT/OUT 端点到达 -> 入队供用户态 read() 取走；
+ * 用户态 write() 首字节为 0x80 或 >= 0xF0 的报文视为 Feature 应答(0xF1/0xF2)，
+ * 存入应答缓冲供主机 GET_REPORT 读取（原版固定回全零导致 PS5 认证失败）。
+ * 实证：PS5 实测下发的质询 SET_REPORT 首字节为 0x80（描述符 0x80 Feature 63B），
+ * 并非公开资料描述的 0xF0，两者都必须入队。 */
+struct f_hidg_feat {
+	char			*buf;
+	unsigned int		len;
+	struct list_head	list;
 };
 
 struct f_hidg {
@@ -77,11 +90,52 @@ struct f_hidg {
 
 	struct usb_ep			*in_ep;
 	struct usb_ep			*out_ep;
+
+	/* NaoYun Auth patch v2: 指向实例层持久暂存（opts->feat）。
+	 * struct f_hidg 每次 UDC 重绑都重建，预置的 Feature 应答必须存在
+	 * configfs 函数实例（f_hid_opts）里才能跨软拔插存活 */
+	struct f_hid_feat_store		*feat;
 };
 
 static inline struct f_hidg *func_to_hidg(struct usb_function *f)
 {
 	return container_of(f, struct f_hidg, func);
+}
+
+/* NaoYun Auth patch v2: 真 DualSense 描述符中的全部 Feature Report ID
+ * （0x05 校准 / 0x09 配对 / 0x20 固件信息 / 0x80-0x81 PS5 实测质询对 / 0xF0-0xF2 Auth），
+ * 这些 ID 的 write() 一律进暂存槽供 GET_REPORT 返回，其余 ID 维持原 IN 端点路径 */
+static inline bool hidg_feat_id(u8 id)
+{
+	switch (id) {
+	case 0x05:
+	case 0x08:
+	case 0x09:
+	case 0x20:
+	case 0x21:
+	case 0x22:
+	case 0x80:
+	case 0x81:
+		return true;
+	default:
+		return id >= 0xF0;
+	}
+}
+
+/* NaoYun Auth patch: 质询/中继报文 ID 判定（入队与应答暂存共用）：
+ * 0x80 = PS5 实测质询 ID；>= 0xF0 = 公开协议 Auth 族（0xF0 质询/0xF1 签名/0xF2 就绪） */
+static inline bool hidg_feat_relay_id(u8 id)
+{
+	return id == 0x80 || id >= 0xF0;
+}
+
+/* NaoYun Auth patch v3: Auth 签名 ID，GET_REPORT 时若响应未到则 STALL 等重试，
+ * 而非像 v2 那样立即返回全零。STALL 给源端求解+中继争取时间（~9ms）。
+ * PS5 对控制端点 STALL 会自动重试，最多 stall N 次后降级回零防死循环 */
+#define HIDG_STALL_MAX  20
+static inline bool hidg_feat_stall_id(u8 id)
+{
+	return id == 0x81;
 }
 
 static void hidg_release(struct device *dev)
@@ -91,6 +145,37 @@ static void hidg_release(struct device *dev)
 	kfree(hidg->report_desc);
 	kfree(hidg->set_report_buf);
 	kfree(hidg);
+}
+
+/* NaoYun Auth patch: 质询入队（单队列，新质询覆盖旧质询——PS5 只认最新一轮） */
+static void hidg_feat_queue(struct f_hidg *hidg, const u8 *data,
+			    unsigned int len)
+{
+	struct f_hidg_feat *feat, *old, *tmp;
+	unsigned long flags;
+
+	feat = kzalloc(sizeof(*feat), GFP_ATOMIC);
+	if (!feat)
+		return;
+	feat->buf = kmemdup(data, len, GFP_ATOMIC);
+	if (!feat->buf) {
+		kfree(feat);
+		return;
+	}
+	feat->len = len;
+
+	spin_lock_irqsave(&hidg->feat->lock, flags);
+	list_for_each_entry_safe(old, tmp, &hidg->feat->queue, list) {
+		list_del(&old->list);
+		kfree(old->buf);
+		kfree(old);
+	}
+	list_add_tail(&feat->list, &hidg->feat->queue);
+	spin_unlock_irqrestore(&hidg->feat->lock, flags);
+
+	pr_info_ratelimited("hidg: feature report queued id=0x%02x len=%u\n",
+			    data[0], len);
+	wake_up(&hidg->read_queue);
 }
 
 /*-------------------------------------------------------------------------*/
@@ -400,15 +485,66 @@ static ssize_t f_hidg_ssreport_read(struct file *file, char __user *buffer,
 	return count;
 }
 
+/* NaoYun Auth patch: 从质询队列取一条 Feature Report 给用户态（非阻塞）。
+ * 返回 >0 已拷贝字节数；0 无质询；<0 用户缓冲过小 */
+static ssize_t f_hidg_feat_read(struct f_hidg *hidg, char __user *buffer,
+				size_t count)
+{
+	struct f_hidg_feat *feat;
+	unsigned long flags;
+	ssize_t ret;
+
+	spin_lock_irqsave(&hidg->feat->lock, flags);
+	if (list_empty(&hidg->feat->queue)) {
+		spin_unlock_irqrestore(&hidg->feat->lock, flags);
+		return 0;
+	}
+	feat = list_first_entry(&hidg->feat->queue, struct f_hidg_feat, list);
+	if (count < feat->len) {
+		spin_unlock_irqrestore(&hidg->feat->lock, flags);
+		return -EINVAL;
+	}
+	list_del(&feat->list);
+	spin_unlock_irqrestore(&hidg->feat->lock, flags);
+
+	ret = feat->len - copy_to_user(buffer, feat->buf, feat->len);
+	kfree(feat->buf);
+	kfree(feat);
+	return ret;
+}
+
 static ssize_t f_hidg_read(struct file *file, char __user *buffer,
 			   size_t count, loff_t *ptr)
 {
 	struct f_hidg *hidg = file->private_data;
+	ssize_t ret;
 
-	if (hidg->use_out_ep)
-		return f_hidg_intout_read(file, buffer, count, ptr);
-	else
-		return f_hidg_ssreport_read(file, buffer, count, ptr);
+	if (!count)
+		return 0;
+
+	/* NaoYun Auth patch: Feature 质询优先于普通报文。
+	 * use_out_ep 模式下质询不进 OUT 读队列，必须在此循环等待，
+	 * 否则落入 intout 路径后非阻塞标志丢失，中继永远读不到质询 */
+	if (hidg->use_out_ep) {
+		while (1) {
+			ret = f_hidg_feat_read(hidg, buffer, count);
+			if (ret != 0)
+				return ret;
+			if (file->f_flags & O_NONBLOCK)
+				return -EAGAIN;
+			if (wait_event_interruptible(hidg->read_queue,
+					!list_empty(&hidg->feat->queue)))
+				return -ERESTARTSYS;
+		}
+	}
+
+	/* 非 use_out_ep（ssreport）模式：质询与 SET_REPORT 报文共用读队列，
+	 * 先取质询，取不到再走原路径 */
+	ret = f_hidg_feat_read(hidg, buffer, count);
+	if (ret != 0)
+		return ret;
+
+	return f_hidg_ssreport_read(file, buffer, count, ptr);
 }
 
 static void f_hidg_req_complete(struct usb_ep *ep, struct usb_request *req)
@@ -427,13 +563,53 @@ static void f_hidg_req_complete(struct usb_ep *ep, struct usb_request *req)
 	wake_up(&hidg->write_queue);
 }
 
-static ssize_t f_hidg_write(struct file *file, const char __user *buffer,
-			    size_t count, loff_t *offp)
+/*
+ * NaoYun Auth patch v4：载荷取入统一入口。
+ *
+ * 为什么要这一层（本机实测，不是猜）：5.15.145-conaco66 是去掉 set_fs 的 ARM64，
+ * 内核线程拿不到用户地址空间——access_ok(内核指针)=0、直接调 .write 传内核指针得 -14(-EFAULT)、
+ * kernel_write() 得 -22(-EINVAL)（它只走 .write_iter，而上游 f_hid 没有）。
+ * 于是内核态写者（naoyun_motion 的出帧节拍）在这台盒上没有任何入口。
+ * 补 .write_iter 是唯一不动用户态链路的做法：VFS 的 __vfs_write 优先 .write，
+ * 现役用户态写者（svc-hid 的 /dev/hidgN、auth 中继的 Feature 应答）走的仍是原函数，逐字节不变。
+ */
+static int hidg_payload_fetch(void *dst, const char __user *src, size_t len,
+			      bool from_kernel)
+{
+	if (from_kernel) {
+		memcpy(dst, (const void __force *)src, len);
+		return 0;
+	}
+	return copy_from_user(dst, src, len) ? -EFAULT : 0;
+}
+
+static ssize_t __f_hidg_write(struct file *file, const char __user *buffer,
+			       size_t count, loff_t *offp, bool from_kernel)
 {
 	struct f_hidg *hidg  = file->private_data;
 	struct usb_request *req;
 	unsigned long flags;
 	ssize_t status = -ENOMEM;
+
+	/* NaoYun Auth patch: Feature ID 的写入为 Feature 应答（校准/固件/签名等），
+	 * 存入对应 ID 槽供主机 GET_REPORT 读取，不走中断 IN 端点 */
+	if (count >= 1 && count <= sizeof(hidg->feat->resp[0])) {
+		u8 hdr;
+
+		if (hidg_payload_fetch(&hdr, buffer, 1, from_kernel))
+			return -EFAULT;
+		if (hidg_feat_id(hdr)) {
+			if (hidg_payload_fetch(hidg->feat->resp[hdr], buffer,
+					       count, from_kernel))
+				return -EFAULT;
+			spin_lock_irqsave(&hidg->feat->lock, flags);
+			hidg->feat->resp_len[hdr] = count;
+			spin_unlock_irqrestore(&hidg->feat->lock, flags);
+			pr_info_ratelimited("hidg: feature response staged id=0x%02x len=%zu\n",
+					    hdr, count);
+			return count;
+		}
+	}
 
 	spin_lock_irqsave(&hidg->write_spinlock, flags);
 
@@ -469,10 +645,10 @@ try_again:
 		goto release_write_pending;
 	}
 
-	status = copy_from_user(req->buf, buffer, count);
+	status = hidg_payload_fetch(req->buf, buffer, count, from_kernel);
 	if (status != 0) {
 		ERROR(hidg->func.config->cdev,
-			"copy_from_user error\n");
+			"payload fetch error\n");
 		status = -EINVAL;
 		goto release_write_pending;
 	}
@@ -520,9 +696,39 @@ release_write_pending:
 	return status;
 }
 
+static ssize_t f_hidg_write(struct file *file, const char __user *buffer,
+			    size_t count, loff_t *offp)
+{
+	/* 用户态写者：路径与 v3 完全一致（.write 仍是 VFS 首选） */
+	return __f_hidg_write(file, buffer, count, offp, false);
+}
+
+/*
+ * 内核态写者入口：kernel_write() → vfs_iter_write() → 这里。
+ * 迭代器先线性化到栈缓冲——鼠标/键盘报文 ≤64 字节，超过 HIDG_KW_MAX 直接拒收：
+ * 半帧比失败更坏（主机会把残缺报文当成一次真实移动）。
+ */
+#define HIDG_KW_MAX 512
+static ssize_t f_hidg_write_iter(struct kiocb *iocb, struct iov_iter *from)
+{
+	struct file	*file = iocb->ki_filp;
+	size_t		 count = iov_iter_count(from);
+	u8		 kbuf[HIDG_KW_MAX];
+
+	if (!count)
+		return 0;
+	if (count > sizeof(kbuf))
+		return -EINVAL;
+	if (copy_from_iter(kbuf, count, from) != count)
+		return -EFAULT;
+	return __f_hidg_write(file, (void __force __user *)kbuf, count,
+			      &iocb->ki_pos, true);
+}
+
 static __poll_t f_hidg_poll(struct file *file, poll_table *wait)
 {
 	struct f_hidg	*hidg  = file->private_data;
+	unsigned long	flags;
 	__poll_t	ret = 0;
 
 	poll_wait(file, &hidg->read_queue, wait);
@@ -532,6 +738,16 @@ static __poll_t f_hidg_poll(struct file *file, poll_table *wait)
 		ret |= EPOLLOUT | EPOLLWRNORM;
 
 	if (hidg->use_out_ep) {
+		/* NaoYun Auth patch v2: Feature 质询队列可读也必须上报。
+		 * Go 运行时对字符设备用 非阻塞+epoll 读：v1 漏报导致 epoll
+		 * 永远等不到 EPOLLIN，用户态中继 goroutine 死等，质询永不被消费 */
+		bool feat_ready;
+
+		spin_lock_irqsave(&hidg->feat->lock, flags);
+		feat_ready = !list_empty(&hidg->feat->queue);
+		spin_unlock_irqrestore(&hidg->feat->lock, flags);
+		if (feat_ready)
+			ret |= EPOLLIN | EPOLLRDNORM;
 		if (READ_COND_INTOUT)
 			ret |= EPOLLIN | EPOLLRDNORM;
 	} else {
@@ -580,6 +796,16 @@ static void hidg_intout_complete(struct usb_ep *ep, struct usb_request *req)
 
 	switch (req->status) {
 	case 0:
+		/* NaoYun Auth patch: 0x80/≥0xF0 为质询/Feature 报文（PS5 实测质询 0x80），
+		 * 旁路到质询队列供用户态中继，不进普通读队列 */
+		if (req->actual > 0 && hidg_feat_relay_id(((u8 *)req->buf)[0])) {
+			hidg_feat_queue(hidg, req->buf, req->actual);
+			req->length = hidg->report_length;
+			if (usb_ep_queue(ep, req, GFP_ATOMIC) < 0)
+				free_ep_req(ep, req);
+			return;
+		}
+
 		req_list = kzalloc(sizeof(*req_list), GFP_ATOMIC);
 		if (!req_list) {
 			ERROR(cdev, "Unable to allocate mem for req_list\n");
@@ -613,6 +839,11 @@ static void hidg_ssreport_complete(struct usb_ep *ep, struct usb_request *req)
 	char *new_buf = NULL;
 	unsigned long flags;
 
+	/* NaoYun Auth debug: 入口无条件记录，定位 PS5 0xF0 质询数据相位的下落 */
+	pr_info("hidg: ssreport_complete status=%d actual=%d id=0x%02x\n",
+		req->status, req->actual,
+		(req->actual > 0 && req->buf) ? ((u8 *)req->buf)[0] : 0);
+
 	if (req->status != 0 || req->buf == NULL || req->actual == 0) {
 		ERROR(cdev,
 		      "%s FAILED: status=%d, buf=%p, actual=%d\n",
@@ -634,6 +865,10 @@ static void hidg_ssreport_complete(struct usb_ep *ep, struct usb_request *req)
 
 	spin_unlock_irqrestore(&hidg->read_spinlock, flags);
 
+	/* NaoYun Auth patch: SET_REPORT 控制通道下发的质询报文同样入队 */
+	if (req->actual > 0 && hidg_feat_relay_id(((u8 *)req->buf)[0]))
+		hidg_feat_queue(hidg, req->buf, req->actual);
+
 	wake_up(&hidg->read_queue);
 }
 
@@ -653,10 +888,51 @@ static int hidg_setup(struct usb_function *f,
 	     "%s crtl_request : bRequestType:0x%x bRequest:0x%x Value:0x%x\n",
 	     __func__, ctrl->bRequestType, ctrl->bRequest, value);
 
+	/* NaoYun Auth debug: 无条件记录全部控制请求，供 PS5 交互取证 */
+	pr_info_ratelimited("hidg setup: type=0x%02x req=0x%02x val=0x%04x idx=0x%04x len=%u\n",
+			    ctrl->bRequestType, ctrl->bRequest, value,
+			    __le16_to_cpu(ctrl->wIndex), length);
+
 	switch ((ctrl->bRequestType << 8) | ctrl->bRequest) {
 	case ((USB_DIR_IN | USB_TYPE_CLASS | USB_RECIP_INTERFACE) << 8
 		  | HID_REQ_GET_REPORT):
 		VDBG(cdev, "get_report\n");
+
+		/* NaoYun Auth patch v2: Feature 类型 GET_REPORT（wValue 高字节 == 0x03）
+		 * 返回对应 Report ID 槽中用户态暂存的真手柄数据；未预置的维持原版空报文行为 */
+		if ((value >> 8) == 0x03) {
+			u8 fid = value & 0xff;
+			unsigned long fflags;
+
+			spin_lock_irqsave(&hidg->feat->lock, fflags);
+			if (hidg->feat->resp_len[fid] > 0) {
+				length = min_t(unsigned, length, hidg->feat->resp_len[fid]);
+				memcpy(req->buf, hidg->feat->resp[fid], length);
+				/* NaoYun Auth patch v3: 命中即清零 stall 计数 */
+				hidg->feat->stall_count[fid] = 0;
+				spin_unlock_irqrestore(&hidg->feat->lock, fflags);
+				/* NaoYun Auth patch v2: 命中实锤日志，证明主机读到了预置真数据 */
+				pr_info_ratelimited("hidg: GET_REPORT id=0x%02x HIT staged, return %u bytes\n",
+						    fid, length);
+				goto respond;
+			}
+
+			/* NaoYun Auth patch v3: 关键 Auth ID (0x81) 响应未到时 STALL 等重试，
+			 * 给源端求解+中继争取时间；stall_count 超限降级回零防死循环 */
+			if (hidg_feat_stall_id(fid) &&
+			    hidg->feat->stall_count[fid] < HIDG_STALL_MAX) {
+				hidg->feat->stall_count[fid]++;
+				spin_unlock_irqrestore(&hidg->feat->lock, fflags);
+				pr_info("hidg: GET_REPORT id=0x%02x STALL #%u, waiting for response\n",
+					fid, hidg->feat->stall_count[fid]);
+				goto stall;
+			}
+
+			spin_unlock_irqrestore(&hidg->feat->lock, fflags);
+			/* NaoYun Auth patch v3: 超限或非关键 ID 降级回全零 */
+			pr_info_ratelimited("hidg: GET_REPORT id=0x%02x MISS (stall=%u), return zeros\n",
+					    fid, hidg->feat->stall_count[fid]);
+		}
 
 		/* send an empty report */
 		length = min_t(unsigned, length, hidg->report_length);
@@ -684,7 +960,10 @@ static int hidg_setup(struct usb_function *f,
 	case ((USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE) << 8
 		  | HID_REQ_SET_REPORT):
 		VDBG(cdev, "set_report | wLength=%d\n", ctrl->wLength);
-		if (hidg->use_out_ep)
+		/* NaoYun Auth patch: Feature 类型 SET_REPORT（wValue 高字节 == 0x03，
+		 * PS5 质询 0xF0）即使在 use_out_ep 模式也必须接收并入队；
+		 * 普通 OUTPUT 报文维持原版 stall 行为 */
+		if (hidg->use_out_ep && (value >> 8) != 0x03)
 			goto stall;
 		req->complete = hidg_ssreport_complete;
 		req->context  = hidg;
@@ -787,6 +1066,21 @@ static void hidg_disable(struct usb_function *f)
 			kfree(list);
 		}
 		spin_unlock_irqrestore(&hidg->read_spinlock, flags);
+	}
+
+	/* NaoYun Auth patch: 清空质询队列防泄漏；
+	 * v2: feat_resp 暂存槽故意不清——PS5 枚举后 700ms 内就读 Feature，
+	 * 预置数据必须跨软拔插(disable/enable)存活，仅重建 function 时初始化 */
+	{
+		struct f_hidg_feat *feat, *tmp;
+
+		spin_lock_irqsave(&hidg->feat->lock, flags);
+		list_for_each_entry_safe(feat, tmp, &hidg->feat->queue, list) {
+			list_del(&feat->list);
+			kfree(feat->buf);
+			kfree(feat);
+		}
+		spin_unlock_irqrestore(&hidg->feat->lock, flags);
 	}
 
 	spin_lock_irqsave(&hidg->write_spinlock, flags);
@@ -903,6 +1197,9 @@ static const struct file_operations f_hidg_fops = {
 	.open		= f_hidg_open,
 	.release	= f_hidg_release,
 	.write		= f_hidg_write,
+	/* NaoYun Auth patch v4: 内核态写者唯一入口（naoyun_motion 出帧）。
+	 * 用户态 write() 不走这里（VFS 优先 .write），现役链路零变化 */
+	.write_iter	= f_hidg_write_iter,
 	.read		= f_hidg_read,
 	.poll		= f_hidg_poll,
 	.llseek		= noop_llseek,
@@ -1192,6 +1489,21 @@ static void hidg_free_inst(struct usb_function_instance *f)
 	if (opts->report_desc_alloc)
 		kfree(opts->report_desc);
 
+	/* NaoYun Auth patch v2: 释放质询队列与实例层持久暂存 */
+	if (opts->feat) {
+		struct f_hidg_feat *feat, *tmp;
+		unsigned long flags;
+
+		spin_lock_irqsave(&opts->feat->lock, flags);
+		list_for_each_entry_safe(feat, tmp, &opts->feat->queue, list) {
+			list_del(&feat->list);
+			kfree(feat->buf);
+			kfree(feat);
+		}
+		spin_unlock_irqrestore(&opts->feat->lock, flags);
+		kfree(opts->feat);
+	}
+
 	kfree(opts);
 }
 
@@ -1205,6 +1517,15 @@ static struct usb_function_instance *hidg_alloc_inst(void)
 	if (!opts)
 		return ERR_PTR(-ENOMEM);
 	mutex_init(&opts->lock);
+	/* NaoYun Auth patch v2: 实例层持久暂存，只随 configfs 函数实例创建/销毁，
+	 * 不随 UDC 重绑重建，预置的 Feature 应答才能真正跨软拔插存活 */
+	opts->feat = kzalloc(sizeof(*opts->feat), GFP_KERNEL);
+	if (!opts->feat) {
+		kfree(opts);
+		return ERR_PTR(-ENOMEM);
+	}
+	spin_lock_init(&opts->feat->lock);
+	INIT_LIST_HEAD(&opts->feat->queue);
 	opts->func_inst.free_func_inst = hidg_free_inst;
 	ret = &opts->func_inst;
 
@@ -1214,6 +1535,7 @@ static struct usb_function_instance *hidg_alloc_inst(void)
 		status = ghid_setup(NULL, HIDG_MINORS);
 		if (status)  {
 			ret = ERR_PTR(status);
+			kfree(opts->feat);
 			kfree(opts);
 			goto unlock;
 		}
@@ -1222,6 +1544,7 @@ static struct usb_function_instance *hidg_alloc_inst(void)
 	opts->minor = hidg_get_minor();
 	if (opts->minor < 0) {
 		ret = ERR_PTR(opts->minor);
+		kfree(opts->feat);
 		kfree(opts);
 		if (ida_is_empty(&hidg_ida))
 			ghid_cleanup();
@@ -1299,6 +1622,8 @@ static struct usb_function *hidg_alloc(struct usb_function_instance *fi)
 		}
 	}
 	hidg->use_out_ep = !opts->no_out_endpoint;
+	/* NaoYun Auth patch v2: 接上实例层持久暂存（跨 UDC 重绑存活） */
+	hidg->feat = opts->feat;
 
 	mutex_unlock(&opts->lock);
 
@@ -1319,6 +1644,11 @@ static struct usb_function *hidg_alloc(struct usb_function_instance *fi)
 DECLARE_USB_FUNCTION_INIT(hid, hidg_alloc_inst, hidg_alloc);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Fabien Chouteau");
+/* NaoYun Auth patch: 身份指纹，agent 通过 /sys/module/usb_f_hid/version 检测是否补丁版，
+ * 防止 guard/重启换回原版模块。改名/删除会导致模块自保失效
+ * v4 = v3 全部能力 + .write_iter（内核态写者入口，鼠标出帧节拍 naoyun_motion 依赖它）；
+ * 版本门是前缀判定（auth_relay.go: PatchedFHidVersionPrefix = "naoyun-auth-v"），升号不用改 Go */
+MODULE_VERSION("naoyun-auth-v4");
 
 int ghid_setup(struct usb_gadget *g, int count)
 {
