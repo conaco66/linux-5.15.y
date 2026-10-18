@@ -34,19 +34,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: 工具链（clang-14 + lld-14 + 交叉 binutils + pahole）
+      - name: 工具链（clang/lld/llvm 要有不带版本号的名字）
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            clang-14 lld-14 llvm-14 build-essential bc bison flex \
+            clang lld llvm clang-14 lld-14 llvm-14 build-essential bc bison flex \
             libelf-dev libssl-dev dwarves kmod rsync \
             device-tree-compiler gcc-aarch64-linux-gnu
+          echo "clang=$(command -v clang) ld.lld=$(command -v ld.lld)"
+          clang --version | head -1
 
       - name: 用盒子现役 config 作种子
         run: |
           test -f naoyun-kernel-config-seed
           cp naoyun-kernel-config-seed .config
-          make ARCH=arm64 CC=clang-14 LD=ld.lld LLVM=1 olddefconfig
+          # 上一次就死在这里（exit 2）：内核 5.15 的 Makefile 在 LLVM=1 时会把 HOSTCC 也指向
+          # `clang`（不带版本号），而只装 clang-14 的机器上没有 /usr/bin/clang ⇒ 连 kconfig
+          # 的宿主工具都编不出来。所以这里既装不带版本号的包，也显式把 HOSTCC/CC 钉死。
+          if ! make ARCH=arm64 HOSTCC=clang CC=clang LD=ld.lld LLVM=1 olddefconfig; then
+            echo "olddefconfig 失败，末 40 行进 job summary"
+            make ARCH=arm64 HOSTCC=clang CC=clang LD=ld.lld LLVM=1 olddefconfig 2>&1 | tail -40 >> "$GITHUB_STEP_SUMMARY"
+            exit 2
+          fi
+          grep -E '^CONFIG_(LOCALVERSION|LTO_CLANG_THIN|USB_DWC3_MESON_G12A|PHY_MESON_G12A_USB2)=' .config || true
 
       - name: 校验补丁已在树里（分支带的是已应用的改动；万一没有就现场应用）
         run: |
@@ -60,13 +70,13 @@ jobs:
 
       - name: 编译 Image + modules + dtbs
         run: |
-          make ARCH=arm64 CC=clang-14 LD=ld.lld LLVM=1 LLVM_IAS=1 \
+          make ARCH=arm64 CC=clang LD=ld.lld LLVM=1 LLVM_IAS=1 \
                LOCALVERSION="$KERNEL_LOCALVERSION" -j"$(nproc)" \
                Image modules dtbs
 
       - name: 装模块树
         run: |
-          make ARCH=arm64 CC=clang-14 LD=ld.lld LLVM=1 LLVM_IAS=1 \
+          make ARCH=arm64 CC=clang LD=ld.lld LLVM=1 LLVM_IAS=1 \
                LOCALVERSION="$KERNEL_LOCALVERSION" \
                INSTALL_MOD_PATH="$PWD/stage/modules-root" modules_install
 
