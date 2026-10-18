@@ -874,7 +874,7 @@ static int dwc3_meson_g12a_probe(struct platform_device *pdev)
 	pm_runtime_enable(dev);
 	pm_runtime_get_sync(dev);
 
-	if (device_create_file(dev, &dev_attr_u2p_reset.attr))
+	if (device_create_file(dev, &dev_attr_u2p_reset))
 		dev_warn(dev, "Failed to create u2p_reset attribute (USB remains functional)\n");
 
 	return 0;
@@ -910,7 +910,7 @@ static int dwc3_meson_g12a_remove(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 	int i;
 
-	device_remove_file(dev, &dev_attr_u2p_reset.attr);
+	device_remove_file(dev, &dev_attr_u2p_reset);
 
 	if (priv->drvdata->otg_switch_supported)
 		usb_role_switch_unregister(priv->role_switch);
